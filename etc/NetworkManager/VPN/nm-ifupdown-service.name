@@ -1,0 +1,5 @@
+[VPN Connection]
+name=ifupdown
+service=org.freedesktop.NetworkManager.ifupdown
+program=/usr/local/libexec/nm-ifupdown-service
+supports-multiple-connections=false

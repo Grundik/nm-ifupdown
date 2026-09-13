@@ -1,0 +1,603 @@
+#!/usr/bin/python3
+"""NetworkManager VPN plugin that brings interfaces up/down via ifupdown.
+
+Install:
+  install -m 0755 nm-ifupdown-service /usr/local/libexec/nm-ifupdown-service
+
+Requires (already in place):
+  /etc/NetworkManager/VPN/nm-ifupdown-service.name
+  D-Bus policy allowing root to own org.freedesktop.NetworkManager.ifupdown
+
+Create a profile (one per ifupdown iface). gateway is the real peer/server
+address (IPv4 or IPv6) — NM installs a host route to it outside the tunnel:
+
+  nmcli connection add type vpn con-name wg0 \\
+      vpn.service-type org.freedesktop.NetworkManager.ifupdown \\
+      connection.interface-name wg0 \\
+      vpn.data "iface=wg0,gateway=x.x.x.x" \\
+      ipv4.method disabled ipv6.method ignore \\
+      connection.autoconnect no
+
+  nmcli connection up wg0
+  nmcli connection down wg0
+
+Keep those ifaces unmanaged so NM does not race ifupdown, e.g.
+/etc/NetworkManager/conf.d/90-ifupdown-unmanaged.conf:
+
+  [keyfile]
+  unmanaged-devices=interface-name:wg0
+
+vpn.data keys (all strings):
+  iface | interface | ifname   — interface for ifup/ifdown (required)
+  gateway | vpn-gateway        — external peer/server IP, IPv4 or IPv6 (required)
+  ifup  | ifdown               — optional override of the binary path
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+from logging.handlers import SysLogHandler
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+SERVICE_NAME = "org.freedesktop.NetworkManager.ifupdown"
+PLUGIN_IFACE = "org.freedesktop.NetworkManager.VPN.Plugin"
+PLUGIN_PATH = "/org/freedesktop/NetworkManager/VPN/Plugin"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+# NMVpnServiceState
+STATE_UNKNOWN = 0
+STATE_INIT = 1
+STATE_SHUTDOWN = 2
+STATE_STARTING = 3
+STATE_STARTED = 4
+STATE_STOPPING = 5
+STATE_STOPPED = 6
+
+# NMVpnPluginFailure
+FAILURE_LOGIN_FAILED = 0
+FAILURE_CONNECT_FAILED = 1
+FAILURE_BAD_IP_CONFIG = 2
+
+# ifup may be slow (DNS, handshakes, PostUp). The D-Bus Connect method
+# returns immediately; NM waits for the Config signal up to vpn.timeout
+# (default 60s, raise via: nmcli c modify wg0 vpn.timeout 120).
+IFUP_TIMEOUT_SEC = 120
+IFDOWN_TIMEOUT_SEC = 30
+WATCH_INTERVAL_MS = 2000
+QUIT_DELAY_MS = 250
+
+log = logging.getLogger("nm-ifupdown")
+
+
+def setup_logging() -> None:
+    level_raw = os.environ.get("NM_VPN_LOG_LEVEL", "2")
+    try:
+        n = int(level_raw)
+    except ValueError:
+        n = 2
+    if n >= 3:
+        level = logging.DEBUG
+    elif n >= 2:
+        level = logging.INFO
+    elif n >= 1:
+        level = logging.WARNING
+    else:
+        level = logging.ERROR
+
+    log.setLevel(level)
+    fmt = logging.Formatter("nm-ifupdown: %(levelname)s: %(message)s")
+
+    stderr = logging.StreamHandler(sys.stderr)
+    stderr.setFormatter(fmt)
+    log.addHandler(stderr)
+
+    try:
+        syslog = SysLogHandler(address="/dev/log")
+        syslog.setFormatter(fmt)
+        log.addHandler(syslog)
+    except OSError:
+        pass
+
+
+def dbus_to_py(value):
+    if isinstance(value, dbus.Dictionary):
+        return {dbus_to_py(k): dbus_to_py(v) for k, v in value.items()}
+    if isinstance(value, (dbus.Array, list, tuple)):
+        return [dbus_to_py(x) for x in value]
+    if isinstance(value, dbus.Boolean):
+        return bool(value)
+    if isinstance(value, (dbus.String, dbus.ObjectPath, dbus.Signature, str)):
+        return str(value)
+    if isinstance(
+        value,
+        (
+            dbus.Byte,
+            dbus.Int16,
+            dbus.Int32,
+            dbus.Int64,
+            dbus.UInt16,
+            dbus.UInt32,
+            dbus.UInt64,
+            int,
+        ),
+    ):
+        return int(value)
+    if isinstance(value, (dbus.Double, float)):
+        return float(value)
+    return value
+
+
+def vpn_data(connection: dict) -> dict:
+    vpn = connection.get("vpn") or {}
+    data = vpn.get("data") or {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def pick_iface(connection: dict) -> str:
+    data = vpn_data(connection)
+    for key in ("iface", "interface", "ifname"):
+        val = (data.get(key) or "").strip()
+        if val:
+            return val
+    con = connection.get("connection") or {}
+    for key in ("interface-name", "id"):
+        val = str(con.get(key) or "").strip()
+        if val and val not in ("--", "*"):
+            return val
+    raise ValueError(
+        "vpn.data.iface is not set (expected e.g. vpn.data iface=wg0)"
+    )
+
+
+def pick_gateway(connection: dict) -> str:
+    data = vpn_data(connection)
+    for key in ("gateway", "vpn-gateway", "ext-gateway", "remote"):
+        val = (data.get(key) or "").strip()
+        if val:
+            return val
+    raise ValueError(
+        "vpn.data.gateway is not set "
+        "(expected peer/server address, e.g. vpn.data gateway=203.0.113.10)"
+    )
+
+
+def gateway_to_nm_variant(addr: str):
+    """Encode gateway for NM Config signal.
+
+    NM requires a non-null external gateway and uses it for the host route
+    that keeps VPN control traffic off the tunnel.  IPv4 is a uint32 in the
+    same form as C inet_addr() (native endian of the network-order bytes).
+    IPv6 is a 16-byte array.
+    """
+    addr = addr.strip()
+    if "%" in addr:
+        addr = addr.split("%", 1)[0]
+
+    try:
+        raw = socket.inet_pton(socket.AF_INET, addr)
+    except OSError:
+        raw = None
+    if raw is not None:
+        # Matches C inet_addr / typical NM plugins: native-endian uint32
+        # over the four network-order octets (fixes 1.0.0.127 vs 127.0.0.1).
+        return dbus.UInt32(struct.unpack("=I", raw)[0])
+
+    try:
+        raw6 = socket.inet_pton(socket.AF_INET6, addr)
+    except OSError as exc:
+        raise ValueError(f"invalid gateway address: {addr!r}") from exc
+    return dbus.Array([dbus.Byte(b) for b in raw6], signature="y")
+
+
+def find_cmd(name: str, override: str | None = None) -> str:
+    if override:
+        if os.path.isfile(override) and os.access(override, os.X_OK):
+            return override
+        raise FileNotFoundError(override)
+    for directory in ("/sbin", "/usr/sbin", "/usr/local/sbin", "/bin", "/usr/bin"):
+        path = os.path.join(directory, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    found = shutil.which(name)
+    if found:
+        return found
+    raise FileNotFoundError(name)
+
+
+def iface_exists(name: str) -> bool:
+    return os.path.isdir(os.path.join("/sys/class/net", name))
+
+
+def iface_is_up(name: str) -> bool:
+    flags_path = os.path.join("/sys/class/net", name, "flags")
+    try:
+        with open(flags_path, encoding="utf-8") as fh:
+            flags = int(fh.read().strip(), 16)
+        return bool(flags & 0x1)  # IFF_UP
+    except (OSError, ValueError):
+        return False
+
+
+def run_cmd(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
+    log.info("exec: %s", " ".join(argv))
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, "PATH": "/sbin:/usr/sbin:/usr/local/sbin:/bin:/usr/bin"},
+        check=False,
+    )
+
+
+class AlreadyStarted(dbus.DBusException):
+    _dbus_error_name = "org.freedesktop.NetworkManager.VPN.Error.AlreadyStarted"
+
+
+class BadArguments(dbus.DBusException):
+    _dbus_error_name = "org.freedesktop.NetworkManager.VPN.Error.BadArguments"
+
+
+class LaunchFailed(dbus.DBusException):
+    _dbus_error_name = "org.freedesktop.NetworkManager.VPN.Error.LaunchFailed"
+
+
+class IfupdownPlugin(dbus.service.Object):
+    def __init__(self, bus: dbus.SystemBus, loop: GLib.MainLoop):
+        self._bus = bus
+        self._loop = loop
+        self._state = STATE_INIT
+        self._iface: str | None = None
+        self._watch_id = None
+        self._quit_id = None
+        self._ifup_proc: subprocess.Popen | None = None
+        self._ifup_lock = threading.Lock()
+        self._cancel = threading.Event()
+        bus_name = dbus.service.BusName(SERVICE_NAME, bus=bus)
+        super().__init__(bus_name, PLUGIN_PATH)
+        self._set_state(STATE_INIT)
+        log.info("plugin ready on %s", SERVICE_NAME)
+
+    def _set_state(self, state: int) -> None:
+        if self._state == state:
+            return
+        self._state = state
+        log.debug("state -> %s", state)
+        self.StateChanged(dbus.UInt32(state))
+        self.PropertiesChanged(
+            PLUGIN_IFACE,
+            {"State": dbus.UInt32(state)},
+            [],
+        )
+
+    def _stop_watch(self) -> None:
+        if self._watch_id is not None:
+            GLib.source_remove(self._watch_id)
+            self._watch_id = None
+
+    def _schedule_quit(self) -> None:
+        if self._quit_id is not None:
+            return
+
+        def _quit():
+            self._loop.quit()
+            return False
+
+        self._quit_id = GLib.timeout_add(QUIT_DELAY_MS, _quit)
+
+    def _watch_iface(self) -> bool:
+        iface = self._iface
+        if not iface or self._state != STATE_STARTED:
+            return False
+        if not iface_exists(iface):
+            log.warning("interface %s disappeared, stopping", iface)
+            self._stop_watch()
+            self.Failure(dbus.UInt32(FAILURE_CONNECT_FAILED))
+            self._set_state(STATE_STOPPED)
+            self._iface = None
+            self._schedule_quit()
+            return False
+        return True
+
+    def _kill_ifup(self) -> None:
+        with self._ifup_lock:
+            proc = self._ifup_proc
+            self._ifup_proc = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        except OSError as exc:
+            log.debug("kill ifup: %s", exc)
+
+    def _run_ifup_worker(self, ifup: str, iface: str) -> tuple[int, str, str]:
+        """Run ifup off the D-Bus thread. Returns (rc, stdout, stderr)."""
+        env = {**os.environ, "PATH": "/sbin:/usr/sbin:/usr/local/sbin:/bin:/usr/bin"}
+        log.info("exec: %s %s", ifup, iface)
+        with self._ifup_lock:
+            if self._cancel.is_set():
+                return (-1, "", "cancelled")
+            proc = subprocess.Popen(
+                [ifup, iface],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            self._ifup_proc = proc
+        try:
+            stdout, stderr = proc.communicate(timeout=IFUP_TIMEOUT_SEC)
+            return (proc.returncode, stdout or "", stderr or "")
+        except subprocess.TimeoutExpired:
+            self._kill_ifup()
+            return (-1, "", f"ifup {iface} timed out after {IFUP_TIMEOUT_SEC}s")
+        finally:
+            with self._ifup_lock:
+                if self._ifup_proc is proc:
+                    self._ifup_proc = None
+
+    def _finish_up_ok(self, iface: str, gateway_str: str, gateway_var) -> None:
+        if self._cancel.is_set() or self._state != STATE_STARTING:
+            log.info("ignoring successful ifup for %s (cancelled/state=%s)", iface, self._state)
+            return
+        if not iface_exists(iface):
+            self._fail(f"ifup {iface} succeeded but {iface} did not appear")
+            return
+
+        config = dbus.Dictionary(
+            {
+                "tundev": dbus.String(iface),
+                "gateway": gateway_var,
+                "has-ip4": dbus.Boolean(False),
+                "has-ip6": dbus.Boolean(False),
+            },
+            signature="sv",
+        )
+        self.Config(config)
+        self._set_state(STATE_STARTED)
+        self._stop_watch()
+        self._watch_id = GLib.timeout_add(WATCH_INTERVAL_MS, self._watch_iface)
+        log.info("connected via ifup %s (gateway %s)", iface, gateway_str)
+
+    def _finish_up_from_worker(
+        self,
+        iface: str,
+        gateway_str: str,
+        gateway_var,
+        rc: int,
+        stdout: str,
+        stderr: str,
+    ) -> bool:
+        """Main-thread callback after background ifup."""
+        if self._cancel.is_set() or self._state != STATE_STARTING:
+            log.info("ifup worker finished but activation was cancelled")
+            return False
+
+        if rc != 0:
+            if iface_exists(iface) and iface_is_up(iface):
+                log.warning(
+                    "ifup %s exited %s but interface is up; continuing\n%s%s",
+                    iface,
+                    rc,
+                    stdout,
+                    stderr,
+                )
+            else:
+                msg = (stderr or stdout or "").strip() or f"ifup {iface} exited {rc}"
+                self._fail(msg)
+                return False
+
+        self._finish_up_ok(iface, gateway_str, gateway_var)
+        return False
+
+    def _bring_up(self, connection: dict) -> None:
+        """Accept Connect quickly; run ifup in a worker thread.
+
+        NetworkManager's D-Bus call to Connect/ConnectInteractive has a short
+        method timeout ("Timeout was reached"). The long vpn.timeout window
+        only applies while waiting for the Config signal after Connect returns.
+        """
+        if self._state in (STATE_STARTING, STATE_STARTED):
+            raise AlreadyStarted("ifupdown plugin already has an active connection")
+
+        try:
+            iface = pick_iface(connection)
+            gateway_str = pick_gateway(connection)
+            gateway_var = gateway_to_nm_variant(gateway_str)
+        except ValueError as exc:
+            raise BadArguments(str(exc)) from exc
+
+        data = vpn_data(connection)
+        try:
+            ifup = find_cmd("ifup", data.get("ifup"))
+        except FileNotFoundError as exc:
+            raise LaunchFailed(f"ifup not found: {exc}") from exc
+
+        self._cancel.clear()
+        self._iface = iface
+        self._set_state(STATE_STARTING)
+        log.info("starting ifup %s in background (gateway %s)", iface, gateway_str)
+
+        def worker():
+            rc, stdout, stderr = self._run_ifup_worker(ifup, iface)
+            GLib.idle_add(
+                self._finish_up_from_worker,
+                iface,
+                gateway_str,
+                gateway_var,
+                rc,
+                stdout,
+                stderr,
+            )
+
+        threading.Thread(target=worker, name=f"ifup-{iface}", daemon=True).start()
+
+    def _fail(self, message: str) -> None:
+        log.error("%s", message)
+        self.Failure(dbus.UInt32(FAILURE_CONNECT_FAILED))
+        self._stop_watch()
+        self._set_state(STATE_STOPPED)
+        self._iface = None
+        self._schedule_quit()
+
+    def _bring_down(self) -> None:
+        iface = self._iface
+        self._cancel.set()
+        self._kill_ifup()
+        self._stop_watch()
+        if self._state in (STATE_STOPPED, STATE_INIT, STATE_SHUTDOWN):
+            self._set_state(STATE_STOPPED)
+            self._schedule_quit()
+            return
+
+        self._set_state(STATE_STOPPING)
+        if iface:
+            try:
+                ifdown = find_cmd("ifdown")
+                result = run_cmd([ifdown, iface], IFDOWN_TIMEOUT_SEC)
+                if result.returncode != 0:
+                    log.warning(
+                        "ifdown %s exited %s\n%s%s",
+                        iface,
+                        result.returncode,
+                        result.stdout,
+                        result.stderr,
+                    )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                log.warning("ifdown %s failed: %s", iface, exc)
+
+        self._iface = None
+        self._set_state(STATE_STOPPED)
+        self._schedule_quit()
+        log.info("disconnected")
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="a{sa{sv}}", out_signature="")
+    def Connect(self, connection):
+        self._bring_up(dbus_to_py(connection))
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="a{sa{sv}}a{sv}", out_signature="")
+    def ConnectInteractive(self, connection, details):
+        del details
+        self._bring_up(dbus_to_py(connection))
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="a{sa{sv}}", out_signature="s")
+    def NeedSecrets(self, settings):
+        del settings
+        return ""
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="a{sa{sv}}", out_signature="")
+    def NewSecrets(self, connection):
+        del connection
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="", out_signature="")
+    def Disconnect(self):
+        self._bring_down()
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="a{sv}", out_signature="")
+    def SetConfig(self, config):
+        del config
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="a{sv}", out_signature="")
+    def SetIp4Config(self, config):
+        del config
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="a{sv}", out_signature="")
+    def SetIp6Config(self, config):
+        del config
+
+    @dbus.service.method(PLUGIN_IFACE, in_signature="s", out_signature="")
+    def SetFailure(self, reason):
+        log.error("SetFailure from NetworkManager: %s", reason)
+        self._fail(str(reason))
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        if interface == PLUGIN_IFACE and prop == "State":
+            return dbus.UInt32(self._state)
+        raise dbus.exceptions.DBusException(
+            "org.freedesktop.DBus.Error.UnknownProperty", prop
+        )
+
+    @dbus.service.method(PROPS_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface != PLUGIN_IFACE:
+            return {}
+        return {"State": dbus.UInt32(self._state)}
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ssv", out_signature="")
+    def Set(self, interface, prop, value):
+        del interface, prop, value
+        raise dbus.exceptions.DBusException(
+            "org.freedesktop.DBus.Error.PropertyReadOnly", "State"
+        )
+
+    @dbus.service.signal(PLUGIN_IFACE, signature="u")
+    def StateChanged(self, state):
+        pass
+
+    @dbus.service.signal(PLUGIN_IFACE, signature="a{sv}")
+    def Config(self, config):
+        pass
+
+    @dbus.service.signal(PLUGIN_IFACE, signature="a{sv}")
+    def Ip4Config(self, ip4config):
+        pass
+
+    @dbus.service.signal(PLUGIN_IFACE, signature="a{sv}")
+    def Ip6Config(self, ip6config):
+        pass
+
+    @dbus.service.signal(PLUGIN_IFACE, signature="u")
+    def Failure(self, reason):
+        pass
+
+    @dbus.service.signal(PLUGIN_IFACE, signature="sas")
+    def SecretsRequired(self, message, secrets):
+        pass
+
+    @dbus.service.signal(PLUGIN_IFACE, signature="s")
+    def Banner(self, banner):
+        pass
+
+    @dbus.service.signal(PROPS_IFACE, signature="sa{sv}as")
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
+
+
+def main() -> int:
+    setup_logging()
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    loop = GLib.MainLoop()
+
+    def handle_signal(signum, _frame):
+        log.info("got signal %s, quitting", signum)
+        loop.quit()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    bus = dbus.SystemBus()
+    IfupdownPlugin(bus, loop)
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

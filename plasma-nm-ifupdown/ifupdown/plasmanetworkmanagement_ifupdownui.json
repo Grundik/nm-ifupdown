@@ -1,0 +1,16 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "ifupdown VPN UI"
+            }
+        ],
+        "Category": "VPNService",
+        "Description": "Bring ifupdown interfaces up/down via NetworkManager",
+        "EnabledByDefault": true,
+        "License": "GPL",
+        "Name": "ifupdown",
+        "Version": "1.0"
+    },
+    "X-NetworkManager-Services": "org.freedesktop.NetworkManager.ifupdown"
+}
