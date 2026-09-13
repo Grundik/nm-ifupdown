@@ -44,6 +44,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from logging.handlers import SysLogHandler
 
 import dbus
@@ -169,7 +170,7 @@ def pick_gateway(connection: dict) -> str:
             return val
     raise ValueError(
         "vpn.data.gateway is not set "
-        "(expected peer/server address, e.g. vpn.data gateway=203.0.113.10)"
+        "(expected peer/server address, e.g. vpn.data gateway=x.x.x.x)"
     )
 
 
@@ -265,6 +266,7 @@ class IfupdownPlugin(dbus.service.Object):
         self._ifup_proc: subprocess.Popen | None = None
         self._ifup_lock = threading.Lock()
         self._cancel = threading.Event()
+        self._config_sent = False
         bus_name = dbus.service.BusName(SERVICE_NAME, bus=bus)
         super().__init__(bus_name, PLUGIN_PATH)
         self._set_state(STATE_INIT)
@@ -327,8 +329,13 @@ class IfupdownPlugin(dbus.service.Object):
         except OSError as exc:
             log.debug("kill ifup: %s", exc)
 
-    def _run_ifup_worker(self, ifup: str, iface: str) -> tuple[int, str, str]:
-        """Run ifup off the D-Bus thread. Returns (rc, stdout, stderr)."""
+    def _run_ifup_worker(self, ifup: str, iface: str, gateway_str: str, gateway_var) -> tuple[int, str, str]:
+        """Run ifup off the D-Bus thread. Returns (rc, stdout, stderr).
+
+        Signal Config as soon as the iface exists — do not wait for ifup to
+        exit. xray tun is created in pre-up while ifup can still sit in post-up
+        racing NM; waiting for ifup then hits vpn.timeout.
+        """
         env = {**os.environ, "PATH": "/sbin:/usr/sbin:/usr/local/sbin:/bin:/usr/bin"}
         log.info("exec: %s %s", ifup, iface)
         with self._ifup_lock:
@@ -343,17 +350,31 @@ class IfupdownPlugin(dbus.service.Object):
             )
             self._ifup_proc = proc
         try:
-            stdout, stderr = proc.communicate(timeout=IFUP_TIMEOUT_SEC)
-            return (proc.returncode, stdout or "", stderr or "")
-        except subprocess.TimeoutExpired:
-            self._kill_ifup()
-            return (-1, "", f"ifup {iface} timed out after {IFUP_TIMEOUT_SEC}s")
+            deadline = time.monotonic() + IFUP_TIMEOUT_SEC
+            signalled = False
+            while True:
+                if self._cancel.is_set():
+                    self._kill_ifup()
+                    return (-1, "", "cancelled")
+                if not signalled and iface_exists(iface):
+                    signalled = True
+                    GLib.idle_add(self._finish_up_ok, iface, gateway_str, gateway_var)
+                rc = proc.poll()
+                if rc is not None:
+                    stdout, stderr = proc.communicate()
+                    return (rc, stdout or "", stderr or "")
+                if time.monotonic() >= deadline:
+                    self._kill_ifup()
+                    return (-1, "", f"ifup {iface} timed out after {IFUP_TIMEOUT_SEC}s")
+                time.sleep(0.1)
         finally:
             with self._ifup_lock:
                 if self._ifup_proc is proc:
                     self._ifup_proc = None
 
     def _finish_up_ok(self, iface: str, gateway_str: str, gateway_var) -> None:
+        if self._config_sent:
+            return
         if self._cancel.is_set() or self._state != STATE_STARTING:
             log.info("ignoring successful ifup for %s (cancelled/state=%s)", iface, self._state)
             return
@@ -361,6 +382,7 @@ class IfupdownPlugin(dbus.service.Object):
             self._fail(f"ifup {iface} succeeded but {iface} did not appear")
             return
 
+        self._config_sent = True
         config = dbus.Dictionary(
             {
                 "tundev": dbus.String(iface),
@@ -386,7 +408,7 @@ class IfupdownPlugin(dbus.service.Object):
         stderr: str,
     ) -> bool:
         """Main-thread callback after background ifup."""
-        if self._cancel.is_set() or self._state != STATE_STARTING:
+        if self._cancel.is_set() or self._state not in (STATE_STARTING, STATE_STARTED):
             log.info("ifup worker finished but activation was cancelled")
             return False
 
@@ -399,12 +421,13 @@ class IfupdownPlugin(dbus.service.Object):
                     stdout,
                     stderr,
                 )
-            else:
+            elif not iface_exists(iface):
                 msg = (stderr or stdout or "").strip() or f"ifup {iface} exited {rc}"
                 self._fail(msg)
                 return False
 
-        self._finish_up_ok(iface, gateway_str, gateway_var)
+        if not self._config_sent:
+            self._finish_up_ok(iface, gateway_str, gateway_var)
         return False
 
     def _bring_up(self, connection: dict) -> None:
@@ -431,12 +454,15 @@ class IfupdownPlugin(dbus.service.Object):
             raise LaunchFailed(f"ifup not found: {exc}") from exc
 
         self._cancel.clear()
+        self._config_sent = False
         self._iface = iface
         self._set_state(STATE_STARTING)
         log.info("starting ifup %s in background (gateway %s)", iface, gateway_str)
 
         def worker():
-            rc, stdout, stderr = self._run_ifup_worker(ifup, iface)
+            rc, stdout, stderr = self._run_ifup_worker(
+                ifup, iface, gateway_str, gateway_var
+            )
             GLib.idle_add(
                 self._finish_up_from_worker,
                 iface,
