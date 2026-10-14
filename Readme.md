@@ -1,8 +1,11 @@
 Simple plugin for Network Manager to just use ifup/ifdown to connect to VPNs
 
+Why you could need this? Imagine you have some tricky VPN like AmneziaWG or XRay,
+but you want to integrate it with NetworkManager, to bring it up or down by native DE means.
+
 Coded by Grok.
 
-For NM support: copy /etc and /usr into /, restart dbus and NetworkManager.
+For NM support: copy `etc` and `usr` project folders into /, restart dbus and NetworkManager.
 
 To add connection:
 ```sh
